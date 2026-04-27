@@ -85,6 +85,7 @@ const PRAYER_EVENT_ID_CODES = {
 };
 const PRAYER_EVENT_COLOR_ID = "8";
 const PRAYER_EVENT_SOURCE = "prayer-times-app";
+const AUTH_SESSION_STORAGE_KEY = "salahSyncAuthSession";
 const SYNC_BATCH_SIZE = 50;
 const SYNC_BATCH_DELAY_MS = 2000;
 const SYNC_RATE_LIMIT_BASE_DELAY_MS = 1000;
@@ -139,6 +140,8 @@ function cacheElements() {
     "#use-manual-location-button",
   );
   elements.retryLocationButton = document.querySelector("#retry-location-button");
+  elements.editLocationButton = document.querySelector("#edit-location-button");
+  elements.locationModeSection = document.querySelector("#location-mode-section");
   elements.locationModeLabel = document.querySelector("#location-mode-label");
   elements.locationValue = document.querySelector("#location-value");
   elements.locationNote = document.querySelector("#location-note");
@@ -190,6 +193,9 @@ function bindEvents() {
   elements.syncCalendarButton.addEventListener("click", handleCalendarSync);
   elements.updateLocationButton.addEventListener("click", handleUpdateLocation);
   elements.settingsForm.addEventListener("submit", handleSettingsConfirm);
+  elements.editLocationButton.addEventListener("click", () => {
+    elements.locationModeSection.hidden = !elements.locationModeSection.hidden;
+  });
   elements.useCurrentLocationButton.addEventListener("click", () => {
     switchToGeolocationMode(true);
   });
@@ -335,6 +341,11 @@ async function initializeGoogleAuth() {
     }
 
     state.authReady = true;
+
+    if (restorePersistedAuthSession()) {
+      return;
+    }
+
     render();
   } catch (error) {
     state.authReady = false;
@@ -398,6 +409,7 @@ function finishInitialSignIn(response) {
   }
 
   state.accessToken = response.access_token;
+  persistAuthSession(response);
   state.errorMessage = "";
   state.authReady = true;
   preparationRequestCounter += 1;
@@ -415,6 +427,7 @@ function resetSession() {
     window.google.accounts.oauth2.revoke(state.accessToken, () => {});
   }
 
+  clearPersistedAuthSession();
   preparationRequestCounter += 1;
   state.location = createLocationState(state.browserTimeZone);
   state.settings = createSettingsState();
@@ -532,6 +545,7 @@ async function resumeSyncAfterReauth() {
     }
 
     state.accessToken = response.access_token;
+    persistAuthSession(response);
     state.authBusy = false;
     state.errorMessage = "";
     state.sync.status = "running";
@@ -570,6 +584,7 @@ async function handleSyncFailure(error) {
 
   if (isAuthExpiredError(error)) {
     state.sync.status = "auth_required";
+    clearPersistedAuthSession();
     state.errorMessage =
       "Your Google session expired while syncing. Sign in again to resume from the last completed batch.";
     setView("error");
@@ -881,7 +896,7 @@ function renderSettings() {
       "Manual entry lets you choose a city and confirm the timezone that should be used.";
   } else {
     elements.manualLocationFields.hidden = true;
-    elements.retryLocationButton.hidden = false;
+    elements.retryLocationButton.hidden = state.location.status !== "error";
     elements.retryLocationButton.disabled = state.location.status === "loading";
     elements.retryLocationButton.textContent =
       state.location.status === "loading" ? "Detecting..." : "Retry";
@@ -889,6 +904,11 @@ function renderSettings() {
     elements.locationValue.textContent = getGeolocationValue();
     elements.locationNote.textContent = getGeolocationNote();
   }
+
+  elements.locationNote.hidden =
+    state.location.mode === "geolocation" &&
+    state.location.status === "resolved" &&
+    elements.locationModeSection.hidden;
 
   const selectedPrayerIds = new Set(state.settings.selectedPrayerIds);
   [...elements.prayerGrid.querySelectorAll("input[type='checkbox']")].forEach(
@@ -899,12 +919,13 @@ function renderSettings() {
 
   elements.confirmSettingsButton.disabled =
     !isSetupValid() || state.preparation.status === "loading";
-  elements.confirmSettingsButton.textContent =
+  const calIconHtml = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`;
+  elements.confirmSettingsButton.innerHTML =
     state.preparation.status === "loading"
-      ? "Preparing prayer times..."
+      ? `${calIconHtml} Adding to Calendar...`
       : state.preparation.status === "ready"
-        ? "Refresh prayer times"
-        : "Prepare prayer times";
+        ? `${calIconHtml} Refresh Calendar`
+        : `${calIconHtml} Add to Calendar`;
 }
 
 function renderConfirmation() {
@@ -970,7 +991,7 @@ function renderProgress() {
 
 function renderSuccess() {
   elements.successMessage.textContent = state.sync.successMessage;
-  elements.successCount.textContent = `${state.sync.insertedCount} events synced`;
+  elements.successCount.textContent = `${state.sync.insertedCount} events added`;
 }
 
 function isClientIdConfigured() {
@@ -1746,6 +1767,91 @@ function requestGoogleAccessToken({ prompt }) {
 
     tokenClient.requestAccessToken({ prompt });
   });
+}
+
+function persistAuthSession(response) {
+  if (!response?.access_token || !canUseSessionStorage()) {
+    return;
+  }
+
+  const expiresInMs =
+    typeof response.expires_in === "number" && Number.isFinite(response.expires_in)
+      ? response.expires_in * 1000
+      : null;
+  const payload = {
+    accessToken: response.access_token,
+    expiresAt: expiresInMs ? Date.now() + expiresInMs : null,
+  };
+
+  try {
+    window.sessionStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage failures and continue with in-memory auth only.
+  }
+}
+
+function restorePersistedAuthSession() {
+  const authSession = readPersistedAuthSession();
+
+  if (!authSession?.accessToken) {
+    return false;
+  }
+
+  state.accessToken = authSession.accessToken;
+  state.errorMessage = "";
+  setView("settings");
+  startGeolocationAttempt(false);
+  return true;
+}
+
+function readPersistedAuthSession() {
+  if (!canUseSessionStorage()) {
+    return null;
+  }
+
+  try {
+    const rawValue = window.sessionStorage.getItem(AUTH_SESSION_STORAGE_KEY);
+
+    if (!rawValue) {
+      return null;
+    }
+
+    const parsedValue = JSON.parse(rawValue);
+
+    if (
+      parsedValue?.expiresAt &&
+      Number.isFinite(parsedValue.expiresAt) &&
+      Date.now() >= parsedValue.expiresAt
+    ) {
+      clearPersistedAuthSession();
+      return null;
+    }
+
+    return parsedValue;
+  } catch {
+    clearPersistedAuthSession();
+    return null;
+  }
+}
+
+function clearPersistedAuthSession() {
+  if (!canUseSessionStorage()) {
+    return;
+  }
+
+  try {
+    window.sessionStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function canUseSessionStorage() {
+  try {
+    return typeof window !== "undefined" && Boolean(window.sessionStorage);
+  } catch {
+    return false;
+  }
 }
 
 async function fetchGoogleCalendarJson(url, options = {}) {
